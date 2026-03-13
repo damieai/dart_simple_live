@@ -1,0 +1,162 @@
+name: Sync Upstream & Build Windows
+
+# 每6小时检查一次上游，或手动触发
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 第一步：检查上游 dev 分支是否有新提交，有则同步到本仓库 dev
+  # ─────────────────────────────────────────────
+  sync-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout 本仓库 dev 分支
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          # 需要有 push 权限，在仓库 Settings → Secrets 里添加名为 SYNC_TOKEN 的 PAT
+          # 若你的仓库 Actions 设置里已允许 workflow 写权限，也可以删掉这行用默认 GITHUB_TOKEN
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch dev
+        run: |
+          git remote add upstream https://github.com/SlotSun/dart_simple_live.git
+          git fetch upstream dev
+
+      - name: Compare and sync
+        id: sync
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/dev)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          echo "Upstream dev: $UPSTREAM_SHA"
+          echo "Local dev:    $LOCAL_SHA"
+
+          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
+            echo "✅ 已是最新，无需同步"
+            echo "updated=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 检测到上游 dev 有新提交，开始同步..."
+            git merge upstream/dev --no-edit
+            git push origin dev
+            echo "updated=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate release tag
+        id: tag
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          VERSION=$(python3 -c "import json; d=json.load(open('assets/app_version.json')); print(d['version'])")
+          TAG="v${VERSION}-dev"
+          # 如果同 tag 已存在则附加构建时间戳，避免冲突
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            TAG="v${VERSION}-dev-$(date +%Y%m%d%H%M)"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG"
+
+  # ─────────────────────────────────────────────
+  # 第二步：同步成功后构建 Windows 产物并发布 Release
+  # ─────────────────────────────────────────────
+  build-windows:
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.updated == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout dev（同步后的最新代码）
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      # 设置 Flutter 环境
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: simple_live_app/pubspec.yaml
+          cache: true
+          channel: "stable"
+
+      - name: Enable Flutter Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Restore Packages
+        run: |
+          cd simple_live_app
+          flutter pub get
+
+      # 安装打包工具
+      - name: Install Fastforge and Inno Setup
+        run: |
+          git clone https://github.com/SlotSun/fastforge.git
+          cd fastforge
+          dart pub global activate melos
+          melos run activate
+          choco install innosetup
+
+      # 添加中文安装语言包
+      - name: Add Chinese language file for Inno Setup
+        shell: powershell
+        run: |
+          Copy-Item "simple_live_app/windows/packaging/exe/ChineseSimplified.isl" `
+            "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+
+      # 构建 Windows ZIP / EXE / MSIX
+      - name: Build Windows
+        shell: pwsh
+        run: |
+          cd simple_live_app
+          fastforge package --platform windows --targets msix,zip,exe --skip-clean
+          cd build/dist/*
+          Get-ChildItem "simple_live_app-*" | ForEach-Object {
+            $newName = $_.Name -replace '^simple_live_app', 'Slive'
+            Rename-Item $_ -NewName $newName
+          }
+
+      # 读取版本信息
+      - name: Read version info
+        id: version
+        uses: juliangruber/read-file-action@v1
+        with:
+          path: assets/app_version.json
+
+      # 上传 Artifacts（可选，供调试用）
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ needs.sync-upstream.outputs.tag }}
+          path: |
+            simple_live_app/build/dist/*/*.msix
+            simple_live_app/build/dist/*/*.zip
+            simple_live_app/build/dist/*/*.exe
+
+      # 发布到 GitHub Release
+      - name: Create Release and Upload Windows
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync-upstream.outputs.tag }}
+          name: "${{ fromJson(steps.version.outputs.content).version }} (Windows Auto Build)"
+          body: |
+            🤖 由 GitHub Actions 自动从上游同步并构建
+            同步来源：SlotSun/dart_simple_live@dev
+
+            ${{ fromJson(steps.version.outputs.content).version_desc }}
+          prerelease: true
+          files: |
+            simple_live_app/build/dist/*/*.msix
+            simple_live_app/build/dist/*/*.zip
+            simple_live_app/build/dist/*/*.exe

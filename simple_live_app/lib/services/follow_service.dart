@@ -267,9 +267,8 @@ class FollowService extends GetxService {
     if (follow == null) {
       return;
     } else {
-      Duration extraDuration = history.watchDuration!.toDuration() -
-          follow.watchDuration!.toDuration();
-      follow.syncDuration = follow.syncDuration + extraDuration.inSeconds;
+      // sync watch-part between history and follow
+      follow.syncDuration = history.syncDuration;
       follow.watchDuration = history.watchDuration;
       follow.watchDurationSec = history.watchDuration!.toDuration().inSeconds;
       await addFollow(follow);

@@ -144,6 +144,10 @@ class FollowSyncResource implements SyncResource<FollowBundle> {
   // follow: cur! and webdav? -> cur_item.add_time>cur_last->keep; else->remove;
   // follow: cur? and webdav! -> remote.item.add_time>cur_last->keep; else->remove
   //
+  // bug!: a.cur_last>b.item.add_time > b.cur_last -> remove
+  // fix: need tombstoning
+  // logic: attr->follow.deleted and follow.updateTime
+  //
   // follow_watchDuration = webdav_watchDuration += syncDuration
   // syncDuration = 0
   List<FollowUser> _mergeFollowList({
